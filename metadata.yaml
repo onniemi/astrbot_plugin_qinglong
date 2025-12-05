@@ -1,0 +1,6 @@
+name: astrbot_plugin_qinglong
+display_name: 青龙面板管理
+desc: 通过 AstrBot 管理青龙面板的环境变量和定时任务
+version: v1.0.0
+author: Haitun
+repo: https://github.com/yourusername/astrbot_plugin_qinglong
