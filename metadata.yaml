@@ -1,6 +1,6 @@
 name: astrbot_plugin_qinglong
 display_name: 青龙面板管理
 desc: 通过聊天管理青龙面板，支持任务管理、环境变量、日志查看等
-version: v1.0.0
+version: v1.0.1
 author: Haitun
 repo: https://github.com/onniemi/astrbot_plugin_qinglong

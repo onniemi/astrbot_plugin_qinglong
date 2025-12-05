@@ -8,12 +8,11 @@ AstrBot 青龙面板管理插件
 2. 定时任务管理（查看、执行、停止、启用、禁用、置顶、删除、日志）
 3. 系统信息查询
 
-版本: 1.0.0
+版本: 1.0.1
 """
 
 import time
-import json
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Any
 
 import httpx
 
@@ -22,8 +21,16 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api import logger
 
 
+# 常量配置
+DEFAULT_TIMEOUT = 10
+TOKEN_EXPIRE_SECONDS = 6 * 24 * 3600  # 6天
+
+
 class QinglongAPI:
-    """青龙面板 API 封装（异步版本）"""
+    """青龙面板 API 封装（异步版本）
+    
+    使用共享的 HTTP 客户端以复用连接池，提高性能。
+    """
     
     def __init__(self, host: str, client_id: str, client_secret: str):
         """初始化青龙 API"""
@@ -32,6 +39,19 @@ class QinglongAPI:
         self.client_secret = client_secret
         self.token: Optional[str] = None
         self.token_expire: float = 0
+        self._client: Optional[httpx.AsyncClient] = None
+    
+    async def _get_client(self) -> httpx.AsyncClient:
+        """获取或创建 HTTP 客户端（复用连接池）"""
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+        return self._client
+    
+    async def close(self):
+        """关闭 HTTP 客户端"""
+        if self._client and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
     
     async def get_token(self) -> bool:
         """获取访问令牌"""
@@ -39,24 +59,27 @@ class QinglongAPI:
             if self.token and time.time() < self.token_expire:
                 return True
             
-            url = f"{self.host}/open/auth/token"
-            params = {
-                "client_id": self.client_id,
-                "client_secret": self.client_secret
-            }
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(url, params=params)
-                result = response.json()
+            client = await self._get_client()
+            response = await client.get(
+                f"{self.host}/open/auth/token",
+                params={"client_id": self.client_id, "client_secret": self.client_secret}
+            )
+            result = response.json()
             
             if result.get('code') == 200:
                 self.token = result['data']['token']
-                self.token_expire = time.time() + 6 * 24 * 3600
+                self.token_expire = time.time() + TOKEN_EXPIRE_SECONDS
                 return True
             else:
                 logger.error(f"获取token失败: {result.get('message')}")
                 return False
         
+        except httpx.TimeoutException:
+            logger.error("获取token超时，请检查网络连接")
+            return False
+        except httpx.ConnectError:
+            logger.error("无法连接到青龙面板，请检查地址配置")
+            return False
         except Exception as e:
             logger.error(f"获取token异常: {e}")
             return False
@@ -68,401 +91,158 @@ class QinglongAPI:
             "Content-Type": "application/json"
         }
     
+    async def _request(
+        self, 
+        method: str, 
+        endpoint: str, 
+        params: Optional[Dict] = None,
+        json_data: Any = None
+    ) -> Tuple[bool, Any]:
+        """统一的请求方法
+        
+        Returns:
+            (success, data) - 成功时返回 (True, data)，失败时返回 (False, error_message)
+        """
+        if not await self.get_token():
+            return False, "认证失败"
+        
+        try:
+            client = await self._get_client()
+            url = f"{self.host}{endpoint}"
+            
+            if method.upper() == "GET":
+                response = await client.get(url, headers=self._get_headers(), params=params)
+            elif method.upper() == "DELETE":
+                response = await client.request("DELETE", url, headers=self._get_headers(), json=json_data)
+            elif method.upper() == "PUT":
+                response = await client.put(url, headers=self._get_headers(), json=json_data)
+            else:  # POST
+                response = await client.post(url, headers=self._get_headers(), json=json_data)
+            
+            result = response.json()
+            
+            if result.get('code') == 200:
+                return True, result.get('data', {})
+            else:
+                return False, result.get('message', '未知错误')
+                
+        except httpx.TimeoutException:
+            return False, "请求超时"
+        except httpx.ConnectError:
+            return False, "连接失败"
+        except Exception as e:
+            return False, str(e)
+    
     async def get_envs(self, search_value: str = "") -> List[Dict]:
         """获取环境变量列表"""
-        if not await self.get_token():
+        params = {"searchValue": search_value} if search_value else None
+        success, data = await self._request("GET", "/open/envs", params=params)
+        
+        if not success:
             return []
         
-        try:
-            url = f"{self.host}/open/envs"
-            params = {"searchValue": search_value} if search_value else {}
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(url, headers=self._get_headers(), params=params)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                data = result.get('data', [])
-                if isinstance(data, dict):
-                    return data.get('data', [])
-                return data if isinstance(data, list) else []
-            else:
-                logger.error(f"获取环境变量失败: {result.get('message')}")
-                return []
-        
-        except Exception as e:
-            logger.error(f"获取环境变量异常: {e}")
-            return []
+        if isinstance(data, dict):
+            return data.get('data', [])
+        return data if isinstance(data, list) else []
     
-    async def add_env(self, name: str, value: str, remarks: str = "") -> bool:
+    async def add_env(self, name: str, value: str, remarks: str = "") -> Tuple[bool, str]:
         """添加环境变量"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/envs"
-            data = [{"name": name, "value": value, "remarks": remarks}]
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.post(url, headers=self._get_headers(), json=data)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info(f"添加环境变量成功: {name}")
-                return True
-            else:
-                logger.error(f"添加环境变量失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"添加环境变量异常: {e}")
-            return False
+        success, data = await self._request("POST", "/open/envs", json_data=[{"name": name, "value": value, "remarks": remarks}])
+        return success, "添加成功" if success else data
     
-    async def update_env(self, env_id: int, name: str, value: str, remarks: str = "") -> bool:
+    async def update_env(self, env_id: int, name: str, value: str, remarks: str = "") -> Tuple[bool, str]:
         """更新环境变量"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/envs"
-            data = {"id": env_id, "name": name, "value": value, "remarks": remarks}
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=data)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info(f"更新环境变量成功: {name}")
-                return True
-            else:
-                logger.error(f"更新环境变量失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"更新环境变量异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/envs", json_data={"id": env_id, "name": name, "value": value, "remarks": remarks})
+        return success, "更新成功" if success else data
     
-    async def delete_env(self, env_id: int) -> bool:
+    async def delete_env(self, env_id: int) -> Tuple[bool, str]:
         """删除环境变量"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/envs"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.request("DELETE", url, headers=self._get_headers(), json=[env_id])
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info(f"删除环境变量成功: ID={env_id}")
-                return True
-            else:
-                logger.error(f"删除环境变量失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"删除环境变量异常: {e}")
-            return False
+        success, data = await self._request("DELETE", "/open/envs", json_data=[env_id])
+        return success, "删除成功" if success else data
     
-    async def enable_env(self, env_ids: List[int]) -> bool:
+    async def enable_env(self, env_ids: List[int]) -> Tuple[bool, str]:
         """启用环境变量"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/envs/enable"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=env_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("启用环境变量成功")
-                return True
-            else:
-                logger.error(f"启用环境变量失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"启用环境变量异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/envs/enable", json_data=env_ids)
+        return success, "启用成功" if success else data
     
-    async def disable_env(self, env_ids: List[int]) -> bool:
+    async def disable_env(self, env_ids: List[int]) -> Tuple[bool, str]:
         """禁用环境变量"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/envs/disable"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=env_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("禁用环境变量成功")
-                return True
-            else:
-                logger.error(f"禁用环境变量失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"禁用环境变量异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/envs/disable", json_data=env_ids)
+        return success, "禁用成功" if success else data
     
     async def get_crons(self, search_value: str = "") -> List[Dict]:
         """获取定时任务列表"""
-        if not await self.get_token():
+        params = {"searchValue": search_value} if search_value else None
+        success, data = await self._request("GET", "/open/crons", params=params)
+        
+        if not success:
             return []
         
-        try:
-            url = f"{self.host}/open/crons"
-            params = {"searchValue": search_value} if search_value else {}
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(url, headers=self._get_headers(), params=params)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                data = result.get('data', [])
-                if isinstance(data, dict):
-                    return data.get('data', [])
-                return data if isinstance(data, list) else []
-            else:
-                logger.error(f"获取定时任务失败: {result.get('message')}")
-                return []
-        
-        except Exception as e:
-            logger.error(f"获取定时任务异常: {e}")
-            return []
+        if isinstance(data, dict):
+            return data.get('data', [])
+        return data if isinstance(data, list) else []
     
-    async def run_cron(self, cron_ids: List[int]) -> bool:
+    async def run_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """执行定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons/run"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("执行定时任务成功")
-                return True
-            else:
-                logger.error(f"执行定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"执行定时任务异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/crons/run", json_data=cron_ids)
+        return success, "执行成功" if success else data
     
-    async def get_cron_log(self, cron_id: int) -> Optional[str]:
-        """获取定时任务日志"""
-        if not await self.get_token():
-            return None
-        
-        try:
-            url = f"{self.host}/open/crons/{cron_id}/log"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(url, headers=self._get_headers())
-                result = response.json()
-            
-            if result.get('code') == 200:
-                return result.get('data', '')
-            else:
-                logger.error(f"获取任务日志失败: {result.get('message')}")
-                return None
-        
-        except Exception as e:
-            logger.error(f"获取任务日志异常: {e}")
-            return None
-    
-    async def stop_cron(self, cron_ids: List[int]) -> bool:
+    async def stop_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """停止定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons/stop"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("停止定时任务成功")
-                return True
-            else:
-                logger.error(f"停止定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"停止定时任务异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/crons/stop", json_data=cron_ids)
+        return success, "停止成功" if success else data
     
-    async def enable_cron(self, cron_ids: List[int]) -> bool:
+    async def enable_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """启用定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons/enable"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("启用定时任务成功")
-                return True
-            else:
-                logger.error(f"启用定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"启用定时任务异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/crons/enable", json_data=cron_ids)
+        return success, "启用成功" if success else data
     
-    async def disable_cron(self, cron_ids: List[int]) -> bool:
+    async def disable_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """禁用定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons/disable"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("禁用定时任务成功")
-                return True
-            else:
-                logger.error(f"禁用定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"禁用定时任务异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/crons/disable", json_data=cron_ids)
+        return success, "禁用成功" if success else data
     
-    async def pin_cron(self, cron_ids: List[int]) -> bool:
+    async def pin_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """置顶定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons/pin"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("置顶定时任务成功")
-                return True
-            else:
-                logger.error(f"置顶定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"置顶定时任务异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/crons/pin", json_data=cron_ids)
+        return success, "置顶成功" if success else data
     
-    async def unpin_cron(self, cron_ids: List[int]) -> bool:
+    async def unpin_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """取消置顶定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons/unpin"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.put(url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("取消置顶定时任务成功")
-                return True
-            else:
-                logger.error(f"取消置顶定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"取消置顶定时任务异常: {e}")
-            return False
+        success, data = await self._request("PUT", "/open/crons/unpin", json_data=cron_ids)
+        return success, "取消置顶成功" if success else data
     
-    async def delete_cron(self, cron_ids: List[int]) -> bool:
+    async def delete_cron(self, cron_ids: List[int]) -> Tuple[bool, str]:
         """删除定时任务"""
-        if not await self.get_token():
-            return False
-        
-        try:
-            url = f"{self.host}/open/crons"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.request("DELETE", url, headers=self._get_headers(), json=cron_ids)
-                result = response.json()
-            
-            if result.get('code') == 200:
-                logger.info("删除定时任务成功")
-                return True
-            else:
-                logger.error(f"删除定时任务失败: {result.get('message')}")
-                return False
-        
-        except Exception as e:
-            logger.error(f"删除定时任务异常: {e}")
-            return False
+        success, data = await self._request("DELETE", "/open/crons", json_data=cron_ids)
+        return success, "删除成功" if success else data
+    
+    async def get_cron_log(self, cron_id: int) -> Tuple[bool, str]:
+        """获取定时任务日志"""
+        success, data = await self._request("GET", f"/open/crons/{cron_id}/log")
+        return success, data if success else data
     
     async def get_system_info(self) -> Optional[Dict]:
         """获取系统信息"""
-        if not await self.get_token():
-            return None
-        
-        try:
-            url = f"{self.host}/open/system"
-            
-            async with httpx.AsyncClient(timeout=10) as client:
-                response = await client.get(url, headers=self._get_headers())
-                result = response.json()
-            
-            if result.get('code') == 200:
-                return result.get('data', {})
-            else:
-                logger.error(f"获取系统信息失败: {result.get('message')}")
-                return None
-        
-        except Exception as e:
-            logger.error(f"获取系统信息异常: {e}")
-            return None
+        success, data = await self._request("GET", "/open/system")
+        return data if success and isinstance(data, dict) else None
 
 
-@register("astrbot_plugin_qinglong", "Your Name", "青龙面板管理插件", "1.0.0")
+@register("astrbot_plugin_qinglong", "Haitun", "青龙面板管理插件", "1.0.1")
 class QinglongPlugin(Star):
     """AstrBot 青龙插件主类"""
     
+    PAGE_SIZE = 10
+    
     def __init__(self, context: Context, config: dict):
-        """初始化插件
-        
-        Args:
-            context: AstrBot 上下文
-            config: 插件配置（从 _conf_schema.json 解析）
-        """
+        """初始化插件"""
         super().__init__(context)
         self.config = config
         
-        # 读取配置项
         ql_host = config.get("qinglong_host", "http://localhost:5700")
         ql_client_id = config.get("qinglong_client_id", "")
         ql_client_secret = config.get("qinglong_client_secret", "")
         
-        # 初始化青龙 API
         self.ql_api = QinglongAPI(ql_host, ql_client_id, ql_client_secret)
         
         logger.info("青龙面板插件已加载")
@@ -475,17 +255,43 @@ class QinglongPlugin(Star):
             yield event.plain_result("❌ 插件未正确初始化，请检查配置")
             return
         
-        message = event.message_str.strip()
-        parts = message.split()
+        parts = event.message_str.strip().split()
+        command = parts[1].lower() if len(parts) > 1 else "help"
         
-        if len(parts) < 2:
-            help_text = """📦 青龙面板管理插件 v1.0
+        # 命令路由
+        handlers = {
+            "help": self._handle_help,
+            "envs": self._handle_envs,
+            "list": self._handle_envs,
+            "add": self._handle_add_env,
+            "update": self._handle_update_env,
+            "delete": self._handle_delete_env,
+            "enable": self._handle_enable_env,
+            "disable": self._handle_disable_env,
+            "ls": self._handle_crons,
+            "run": self._handle_run_cron,
+            "stop": self._handle_stop_cron,
+            "log": self._handle_cron_log,
+            "cron": self._handle_cron_action,
+            "info": self._handle_info,
+        }
+        
+        handler = handlers.get(command)
+        if handler:
+            async for result in handler(event, parts):
+                yield result
+        else:
+            yield event.plain_result(f"❌ 未知命令: {command}\n使用 /ql 查看帮助")
+    
+    async def _handle_help(self, event: AstrMessageEvent, parts: list):
+        """显示帮助信息"""
+        help_text = """📦 青龙面板管理插件 v1.0.1
 
 📋 环境变量:
 /ql envs [关键词] [页码] - 查看环境变量
 /ql add <名称> <值> [备注] - 添加
-/ql update <名称> <值> [备注] - 更新（按名称）
-/ql update id:<ID> <值> [备注] - 更新（按ID）
+/ql update <名称> <值> - 更新（按名称）
+/ql update id:<ID> <值> - 更新（按ID）
 /ql delete <名称> - 删除
 /ql enable/disable <名称> - 启用/禁用
 
@@ -500,369 +306,314 @@ class QinglongPlugin(Star):
 
 📊 系统信息:
 /ql info - 查看系统信息"""
-            yield event.plain_result(help_text)
+        yield event.plain_result(help_text)
+    
+    async def _handle_envs(self, event: AstrMessageEvent, parts: list):
+        """查看环境变量列表"""
+        search_value = ""
+        page = 1
+        
+        if len(parts) > 2:
+            if parts[2].isdigit():
+                page = int(parts[2])
+            else:
+                search_value = parts[2]
+                if len(parts) > 3 and parts[3].isdigit():
+                    page = int(parts[3])
+        
+        envs = await self.ql_api.get_envs(search_value)
+        
+        if not envs:
+            msg = f"❌ 未找到包含 '{search_value}' 的环境变量" if search_value else "📭 暂无环境变量"
+            yield event.plain_result(msg)
             return
         
-        command = parts[1].lower()
+        total = len(envs)
+        start = (page - 1) * self.PAGE_SIZE
+        page_envs = envs[start:start + self.PAGE_SIZE]
         
-        # 查看环境变量列表
-        if command in ("list", "envs"):
-            search_value = ""
-            page = 1
-            page_size = 10
-            
-            if len(parts) > 2:
-                try:
-                    page = int(parts[2])
-                except ValueError:
-                    search_value = parts[2]
-                    if len(parts) > 3:
-                        try:
-                            page = int(parts[3])
-                        except ValueError:
-                            pass
-            
-            envs = await self.ql_api.get_envs(search_value)
-            
-            if not envs:
-                if search_value:
-                    yield event.plain_result(f"❌ 未找到包含 '{search_value}' 的环境变量")
-                else:
-                    yield event.plain_result("📭 暂无环境变量")
+        if not page_envs:
+            yield event.plain_result(f"❌ 页码超出范围 (共 {(total + self.PAGE_SIZE - 1) // self.PAGE_SIZE} 页)")
+            return
+        
+        search_info = f" (搜索: {search_value})" if search_value else ""
+        result = f"📋 环境变量列表{search_info} (第 {page} 页，共 {total} 个):\n\n"
+        
+        for env in page_envs:
+            status = "🟢" if env.get('status') == 0 else "🔴"
+            value = env.get('value', '')
+            result += f"{status} {env.get('name')}\n"
+            result += f"  ID: {env.get('id')}\n"
+            result += f"  值: {value[:50]}{'...' if len(value) > 50 else ''}\n"
+            if env.get('remarks'):
+                result += f"  备注: {env.get('remarks')}\n"
+            result += "\n"
+        
+        total_pages = (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        if page < total_pages:
+            next_cmd = f"/ql envs {search_value} {page + 1}" if search_value else f"/ql envs {page + 1}"
+            result += f"💡 使用 {next_cmd} 查看下一页"
+        
+        yield event.plain_result(result)
+    
+    async def _handle_add_env(self, event: AstrMessageEvent, parts: list):
+        """添加环境变量"""
+        if len(parts) < 4:
+            yield event.plain_result("使用方法: /ql add <变量名> <变量值> [备注]")
+            return
+        
+        name, value = parts[2], parts[3]
+        remarks = " ".join(parts[4:]) if len(parts) > 4 else ""
+        
+        success, msg = await self.ql_api.add_env(name, value, remarks)
+        yield event.plain_result(f"{'✅' if success else '❌'} {msg}: {name}")
+    
+    async def _handle_update_env(self, event: AstrMessageEvent, parts: list):
+        """更新环境变量"""
+        if len(parts) < 4:
+            yield event.plain_result("使用方法:\n/ql update <变量名> <值>\n/ql update id:<ID> <值>")
+            return
+        
+        name_or_id = parts[2]
+        value = " ".join(parts[3:])  # 值可能包含空格
+        
+        # 按 ID 更新
+        if name_or_id.startswith("id:"):
+            try:
+                env_id = int(name_or_id[3:])
+            except ValueError:
+                yield event.plain_result(f"❌ 无效的ID格式: {name_or_id}")
                 return
             
-            total = len(envs)
-            start = (page - 1) * page_size
-            end = start + page_size
-            page_envs = envs[start:end]
+            all_envs = await self.ql_api.get_envs("")
+            target_env = next((e for e in all_envs if e.get('id') == env_id), None)
             
-            if not page_envs:
-                yield event.plain_result(f"❌ 页码超出范围 (共 {(total + page_size - 1) // page_size} 页)")
+            if not target_env:
+                yield event.plain_result(f"❌ 未找到ID为 {env_id} 的环境变量")
                 return
             
-            search_info = f" (搜索: {search_value})" if search_value else ""
-            result = f"📋 环境变量列表{search_info} (第 {page} 页，共 {total} 个):\n\n"
-            
-            for env in page_envs:
-                status = "🟢" if env.get('status') == 0 else "🔴"
-                result += f"{status} {env.get('name')}\n"
-                result += f"  ID: {env.get('id')}\n"
-                value = env.get('value', '')
-                result += f"  值: {value[:50]}{'...' if len(value) > 50 else ''}\n"
-                if env.get('remarks'):
-                    result += f"  备注: {env.get('remarks')}\n"
-                result += "\n"
-            
-            total_pages = (total + page_size - 1) // page_size
-            if page < total_pages:
-                next_cmd = f"/ql envs {search_value} {page + 1}" if search_value else f"/ql envs {page + 1}"
-                result += f"💡 使用 {next_cmd} 查看下一页"
-            
+            success, msg = await self.ql_api.update_env(env_id, target_env.get('name'), value, target_env.get('remarks', ''))
+            if success:
+                yield event.plain_result(f"✅ 更新成功\nID: {env_id}\n名称: {target_env.get('name')}")
+            else:
+                yield event.plain_result(f"❌ 更新失败: {msg}")
+            return
+        
+        # 按名称更新
+        envs = await self.ql_api.get_envs(name_or_id)
+        
+        if not envs:
+            yield event.plain_result(f"❌ 未找到环境变量: {name_or_id}")
+            return
+        
+        if len(envs) > 1:
+            result = f"⚠️ 找到 {len(envs)} 个名为 '{name_or_id}' 的变量:\n\n"
+            for env in envs:
+                result += f"ID: {env.get('id')} - {env.get('remarks', '无备注')}\n"
+            result += f"\n💡 使用 /ql update id:{envs[0].get('id')} <新值> 精确更新"
             yield event.plain_result(result)
+            return
         
-        # 添加环境变量
-        elif command == "add":
-            if len(parts) < 4:
-                yield event.plain_result("使用方法: /ql add <变量名> <变量值> [备注]")
-                return
-            
-            name = parts[2]
-            value = parts[3]
-            remarks = " ".join(parts[4:]) if len(parts) > 4 else ""
-            
-            if await self.ql_api.add_env(name, value, remarks):
-                yield event.plain_result(f"✅ 添加环境变量成功: {name}")
-            else:
-                yield event.plain_result(f"❌ 添加环境变量失败: {name}")
+        env = envs[0]
+        success, msg = await self.ql_api.update_env(env['id'], name_or_id, value, env.get('remarks', ''))
+        yield event.plain_result(f"{'✅' if success else '❌'} {msg}: {name_or_id}")
+    
+    async def _handle_delete_env(self, event: AstrMessageEvent, parts: list):
+        """删除环境变量"""
+        if len(parts) < 3:
+            yield event.plain_result("使用方法: /ql delete <变量名>")
+            return
         
-        # 更新环境变量
-        elif command == "update":
-            if len(parts) < 4:
-                yield event.plain_result("使用方法:\n/ql update <变量名> <值>\n/ql update id:<ID> <值>\n\n💡 值会自动合并所有空格后的内容")
-                return
-            
-            name_or_id = parts[2]
-            # 将剩余所有部分作为值（cookie 等值可能包含空格）
-            value = " ".join(parts[3:])
-            remarks = ""  # 更新时不修改备注，保留原备注
-            
-            if name_or_id.startswith("id:"):
-                try:
-                    env_id = int(name_or_id[3:])
-                    all_envs = await self.ql_api.get_envs("")
-                    target_env = next((e for e in all_envs if e.get('id') == env_id), None)
-                    
-                    if not target_env:
-                        yield event.plain_result(f"❌ 未找到ID为 {env_id} 的环境变量")
-                        return
-                    
-                    original_name = target_env.get('name')
-                    final_remarks = target_env.get('remarks', '')  # 保留原备注
-                    
-                    if await self.ql_api.update_env(env_id, original_name, value, final_remarks):
-                        result = f"✅ 更新环境变量成功\nID: {env_id}\n名称: {original_name}"
-                        yield event.plain_result(result)
-                    else:
-                        yield event.plain_result(f"❌ 更新环境变量失败: ID {env_id}")
-                    return
-                    
-                except ValueError:
-                    yield event.plain_result(f"❌ 无效的ID格式: {name_or_id}")
-                    return
-            
-            name = name_or_id
-            envs = await self.ql_api.get_envs(name)
-            
-            if not envs:
-                yield event.plain_result(f"❌ 未找到环境变量: {name}")
-                return
-            
-            if len(envs) > 1:
-                result = f"⚠️ 找到 {len(envs)} 个名为 '{name}' 的变量:\n\n"
-                for env in envs:
-                    result += f"ID: {env.get('id')} - {env.get('remarks', '无备注')}\n"
-                result += f"\n💡 使用 /ql update id:{envs[0].get('id')} <新值> 精确更新"
-                yield event.plain_result(result)
-                return
-            
-            env = envs[0]
-            original_remarks = env.get('remarks', '')  # 保留原备注
-            if await self.ql_api.update_env(env['id'], name, value, original_remarks):
-                yield event.plain_result(f"✅ 更新环境变量成功: {name}")
-            else:
-                yield event.plain_result(f"❌ 更新环境变量失败: {name}")
+        name = parts[2]
+        envs = await self.ql_api.get_envs(name)
         
-        # 删除环境变量
-        elif command == "delete":
-            if len(parts) < 3:
-                yield event.plain_result("使用方法: /ql delete <变量名>")
-                return
-            
-            name = parts[2]
-            envs = await self.ql_api.get_envs(name)
-            
-            if not envs:
-                yield event.plain_result(f"❌ 未找到环境变量: {name}")
-                return
-            
-            env = envs[0]
-            if await self.ql_api.delete_env(env['id']):
-                yield event.plain_result(f"✅ 删除环境变量成功: {name}")
-            else:
-                yield event.plain_result(f"❌ 删除环境变量失败: {name}")
+        if not envs:
+            yield event.plain_result(f"❌ 未找到环境变量: {name}")
+            return
         
-        # 启用环境变量
-        elif command == "enable":
-            if len(parts) < 3:
-                yield event.plain_result("使用方法: /ql enable <变量名>")
-                return
-            
-            name = parts[2]
-            envs = await self.ql_api.get_envs(name)
-            
-            if not envs:
-                yield event.plain_result(f"❌ 未找到环境变量: {name}")
-                return
-            
-            env_ids = [env['id'] for env in envs]
-            if await self.ql_api.enable_env(env_ids):
-                yield event.plain_result(f"✅ 启用环境变量成功: {name}")
-            else:
-                yield event.plain_result(f"❌ 启用环境变量失败: {name}")
+        success, msg = await self.ql_api.delete_env(envs[0]['id'])
+        yield event.plain_result(f"{'✅' if success else '❌'} {msg}: {name}")
+    
+    async def _handle_enable_env(self, event: AstrMessageEvent, parts: list):
+        """启用环境变量"""
+        if len(parts) < 3:
+            yield event.plain_result("使用方法: /ql enable <变量名>")
+            return
         
-        # 禁用环境变量
-        elif command == "disable":
-            if len(parts) < 3:
-                yield event.plain_result("使用方法: /ql disable <变量名>")
-                return
-            
-            name = parts[2]
-            envs = await self.ql_api.get_envs(name)
-            
-            if not envs:
-                yield event.plain_result(f"❌ 未找到环境变量: {name}")
-                return
-            
-            env_ids = [env['id'] for env in envs]
-            if await self.ql_api.disable_env(env_ids):
-                yield event.plain_result(f"✅ 禁用环境变量成功: {name}")
-            else:
-                yield event.plain_result(f"❌ 禁用环境变量失败: {name}")
+        name = parts[2]
+        envs = await self.ql_api.get_envs(name)
         
-        # 查看定时任务列表
-        elif command == "ls":
-            page = 1
-            page_size = 10
-            
-            if len(parts) > 2:
-                try:
-                    page = int(parts[2])
-                except ValueError:
-                    yield event.plain_result("❌ 页码必须是数字")
-                    return
-            
-            crons = await self.ql_api.get_crons()
-            
-            if not crons:
-                yield event.plain_result("📭 暂无定时任务")
-                return
-            
-            total = len(crons)
-            start = (page - 1) * page_size
-            end = start + page_size
-            page_crons = crons[start:end]
-            
-            if not page_crons:
-                yield event.plain_result(f"❌ 页码超出范围 (共 {(total + page_size - 1) // page_size} 页)")
-                return
-            
-            result = f"📋 定时任务列表 (第 {page} 页，共 {total} 个):\n\n"
-            for cron in page_crons:
-                status = "🟢" if cron.get('status') == 0 else "🔴"
-                result += f"{status} {cron.get('name', '未命名')}\n"
-                result += f"  ID: {cron.get('id')}\n"
-                cmd = cron.get('command', '')
-                result += f"  命令: {cmd[:50]}{'...' if len(cmd) > 50 else ''}\n"
-                result += f"  定时: {cron.get('schedule', '无')}\n\n"
-            
-            total_pages = (total + page_size - 1) // page_size
-            if page < total_pages:
-                result += f"💡 使用 /ql ls {page + 1} 查看下一页"
-            
-            yield event.plain_result(result)
+        if not envs:
+            yield event.plain_result(f"❌ 未找到环境变量: {name}")
+            return
         
-        # 执行定时任务
-        elif command == "run":
-            if len(parts) < 3:
-                yield event.plain_result("使用方法: /ql run <任务ID>")
-                return
-            
-            try:
-                cron_id = int(parts[2])
-            except ValueError:
-                yield event.plain_result("❌ 任务ID必须是数字")
-                return
-            
-            if await self.ql_api.run_cron([cron_id]):
-                yield event.plain_result(f"✅ 已启动任务: {cron_id}\n💡 使用 /ql log {cron_id} 查看日志")
-            else:
-                yield event.plain_result(f"❌ 执行任务失败: {cron_id}")
+        success, msg = await self.ql_api.enable_env([env['id'] for env in envs])
+        yield event.plain_result(f"{'✅' if success else '❌'} {msg}: {name}")
+    
+    async def _handle_disable_env(self, event: AstrMessageEvent, parts: list):
+        """禁用环境变量"""
+        if len(parts) < 3:
+            yield event.plain_result("使用方法: /ql disable <变量名>")
+            return
         
-        # 查看任务日志
-        elif command == "log":
-            if len(parts) < 3:
-                yield event.plain_result("使用方法: /ql log <任务ID>")
-                return
-            
-            try:
-                cron_id = int(parts[2])
-            except ValueError:
-                yield event.plain_result("❌ 任务ID必须是数字")
-                return
-            
-            log_content = await self.ql_api.get_cron_log(cron_id)
-            
-            if log_content is None:
-                yield event.plain_result(f"❌ 获取任务日志失败: {cron_id}")
-                return
-            
-            if not log_content:
-                yield event.plain_result(f"📝 任务 {cron_id} 暂无日志")
-                return
-            
-            if len(log_content) > 1000:
-                log_content = "...\n" + log_content[-1000:]
-            
-            yield event.plain_result(f"📝 任务 {cron_id} 日志:\n\n{log_content}")
+        name = parts[2]
+        envs = await self.ql_api.get_envs(name)
         
-        # 停止任务
-        elif command == "stop":
-            if len(parts) < 3:
-                yield event.plain_result("使用方法: /ql stop <任务ID>")
-                return
-            
-            try:
-                cron_id = int(parts[2])
-            except ValueError:
-                yield event.plain_result("❌ 任务ID必须是数字")
-                return
-            
-            if await self.ql_api.stop_cron([cron_id]):
-                yield event.plain_result(f"✅ 已停止任务: {cron_id}")
-            else:
-                yield event.plain_result(f"❌ 停止任务失败: {cron_id}")
+        if not envs:
+            yield event.plain_result(f"❌ 未找到环境变量: {name}")
+            return
         
-        # 定时任务管理
-        elif command == "cron":
-            if len(parts) < 4:
-                yield event.plain_result("使用方法:\n/ql cron enable/disable <任务ID>\n/ql cron pin/unpin <任务ID>\n/ql cron delete <任务ID>")
-                return
-            
-            action = parts[2].lower()
-            try:
-                cron_id = int(parts[3])
-            except ValueError:
-                yield event.plain_result("❌ 任务ID必须是数字")
-                return
-            
-            if action == "enable":
-                if await self.ql_api.enable_cron([cron_id]):
-                    yield event.plain_result(f"✅ 已启用任务: {cron_id}")
-                else:
-                    yield event.plain_result(f"❌ 启用任务失败: {cron_id}")
-            
-            elif action == "disable":
-                if await self.ql_api.disable_cron([cron_id]):
-                    yield event.plain_result(f"✅ 已禁用任务: {cron_id}")
-                else:
-                    yield event.plain_result(f"❌ 禁用任务失败: {cron_id}")
-            
-            elif action == "pin":
-                if await self.ql_api.pin_cron([cron_id]):
-                    yield event.plain_result(f"📌 已置顶任务: {cron_id}")
-                else:
-                    yield event.plain_result(f"❌ 置顶任务失败: {cron_id}")
-            
-            elif action == "unpin":
-                if await self.ql_api.unpin_cron([cron_id]):
-                    yield event.plain_result(f"📌 已取消置顶: {cron_id}")
-                else:
-                    yield event.plain_result(f"❌ 取消置顶失败: {cron_id}")
-            
-            elif action == "delete":
-                if await self.ql_api.delete_cron([cron_id]):
-                    yield event.plain_result(f"✅ 已删除任务: {cron_id}")
-                else:
-                    yield event.plain_result(f"❌ 删除任务失败: {cron_id}")
-            
-            else:
-                yield event.plain_result(f"❌ 未知操作: {action}\n支持: enable, disable, pin, unpin, delete")
+        success, msg = await self.ql_api.disable_env([env['id'] for env in envs])
+        yield event.plain_result(f"{'✅' if success else '❌'} {msg}: {name}")
+    
+    async def _handle_crons(self, event: AstrMessageEvent, parts: list):
+        """查看定时任务列表"""
+        page = 1
+        if len(parts) > 2 and parts[2].isdigit():
+            page = int(parts[2])
         
-        # 系统信息
-        elif command == "info":
-            system_info = await self.ql_api.get_system_info()
-            
-            if not system_info:
-                yield event.plain_result("❌ 获取系统信息失败")
-                return
-            
-            result = "📊 青龙面板系统信息:\n\n"
-            
-            if 'version' in system_info:
-                result += f"🖥️ 版本: {system_info['version']}"
-                if 'branch' in system_info:
-                    result += f" ({system_info['branch']})"
-                result += "\n"
-            
-            if 'isInitialized' in system_info:
-                status = "✅ 已初始化" if system_info['isInitialized'] else "⚠️ 未初始化"
-                result += f"📌 状态: {status}\n"
-            
-            yield event.plain_result(result)
+        crons = await self.ql_api.get_crons()
         
+        if not crons:
+            yield event.plain_result("📭 暂无定时任务")
+            return
+        
+        total = len(crons)
+        start = (page - 1) * self.PAGE_SIZE
+        page_crons = crons[start:start + self.PAGE_SIZE]
+        
+        if not page_crons:
+            yield event.plain_result(f"❌ 页码超出范围 (共 {(total + self.PAGE_SIZE - 1) // self.PAGE_SIZE} 页)")
+            return
+        
+        result = f"📋 定时任务列表 (第 {page} 页，共 {total} 个):\n\n"
+        for cron in page_crons:
+            status = "🟢" if cron.get('status') == 0 else "🔴"
+            cmd = cron.get('command', '')
+            result += f"{status} {cron.get('name', '未命名')}\n"
+            result += f"  ID: {cron.get('id')}\n"
+            result += f"  命令: {cmd[:50]}{'...' if len(cmd) > 50 else ''}\n"
+            result += f"  定时: {cron.get('schedule', '无')}\n\n"
+        
+        total_pages = (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+        if page < total_pages:
+            result += f"💡 使用 /ql ls {page + 1} 查看下一页"
+        
+        yield event.plain_result(result)
+    
+    async def _handle_run_cron(self, event: AstrMessageEvent, parts: list):
+        """执行定时任务"""
+        if len(parts) < 3:
+            yield event.plain_result("使用方法: /ql run <任务ID>")
+            return
+        
+        try:
+            cron_id = int(parts[2])
+        except ValueError:
+            yield event.plain_result("❌ 任务ID必须是数字")
+            return
+        
+        success, msg = await self.ql_api.run_cron([cron_id])
+        if success:
+            yield event.plain_result(f"✅ 已启动任务: {cron_id}\n💡 使用 /ql log {cron_id} 查看日志")
         else:
-            yield event.plain_result(f"❌ 未知命令: {command}\n使用 /ql 查看帮助")
+            yield event.plain_result(f"❌ 执行失败: {msg}")
+    
+    async def _handle_stop_cron(self, event: AstrMessageEvent, parts: list):
+        """停止定时任务"""
+        if len(parts) < 3:
+            yield event.plain_result("使用方法: /ql stop <任务ID>")
+            return
+        
+        try:
+            cron_id = int(parts[2])
+        except ValueError:
+            yield event.plain_result("❌ 任务ID必须是数字")
+            return
+        
+        success, msg = await self.ql_api.stop_cron([cron_id])
+        yield event.plain_result(f"{'✅ 已停止任务' if success else '❌ 停止失败'}: {cron_id}")
+    
+    async def _handle_cron_log(self, event: AstrMessageEvent, parts: list):
+        """查看任务日志"""
+        if len(parts) < 3:
+            yield event.plain_result("使用方法: /ql log <任务ID>")
+            return
+        
+        try:
+            cron_id = int(parts[2])
+        except ValueError:
+            yield event.plain_result("❌ 任务ID必须是数字")
+            return
+        
+        success, log_content = await self.ql_api.get_cron_log(cron_id)
+        
+        if not success:
+            yield event.plain_result(f"❌ 获取日志失败: {log_content}")
+            return
+        
+        if not log_content:
+            yield event.plain_result(f"📝 任务 {cron_id} 暂无日志")
+            return
+        
+        if len(log_content) > 1000:
+            log_content = "...\n" + log_content[-1000:]
+        
+        yield event.plain_result(f"📝 任务 {cron_id} 日志:\n\n{log_content}")
+    
+    async def _handle_cron_action(self, event: AstrMessageEvent, parts: list):
+        """定时任务操作（启用/禁用/置顶/删除）"""
+        if len(parts) < 4:
+            yield event.plain_result("使用方法:\n/ql cron enable/disable <任务ID>\n/ql cron pin/unpin <任务ID>\n/ql cron delete <任务ID>")
+            return
+        
+        action = parts[2].lower()
+        try:
+            cron_id = int(parts[3])
+        except ValueError:
+            yield event.plain_result("❌ 任务ID必须是数字")
+            return
+        
+        actions = {
+            "enable": (self.ql_api.enable_cron, "启用"),
+            "disable": (self.ql_api.disable_cron, "禁用"),
+            "pin": (self.ql_api.pin_cron, "置顶"),
+            "unpin": (self.ql_api.unpin_cron, "取消置顶"),
+            "delete": (self.ql_api.delete_cron, "删除"),
+        }
+        
+        if action not in actions:
+            yield event.plain_result(f"❌ 未知操作: {action}\n支持: enable, disable, pin, unpin, delete")
+            return
+        
+        func, action_name = actions[action]
+        success, msg = await func([cron_id])
+        icon = "📌" if action in ("pin", "unpin") else ("✅" if success else "❌")
+        yield event.plain_result(f"{icon} {action_name}任务 {cron_id}: {msg}")
+    
+    async def _handle_info(self, event: AstrMessageEvent, parts: list):
+        """查看系统信息"""
+        system_info = await self.ql_api.get_system_info()
+        
+        if not system_info:
+            yield event.plain_result("❌ 获取系统信息失败")
+            return
+        
+        result = "📊 青龙面板系统信息:\n\n"
+        
+        if 'version' in system_info:
+            result += f"🖥️ 版本: {system_info['version']}"
+            if 'branch' in system_info:
+                result += f" ({system_info['branch']})"
+            result += "\n"
+        
+        if 'isInitialized' in system_info:
+            status = "✅ 已初始化" if system_info['isInitialized'] else "⚠️ 未初始化"
+            result += f"📌 状态: {status}\n"
+        
+        yield event.plain_result(result)
     
     async def terminate(self):
         """插件卸载时调用"""
+        await self.ql_api.close()
         logger.info("青龙面板插件已卸载")
