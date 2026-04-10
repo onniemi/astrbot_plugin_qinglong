@@ -13,5 +13,15 @@
     "type": "string",
     "default": "",
     "description": "青龙面板应用密钥"
+  },
+  "enable_whitelist": {
+    "type": "bool",
+    "default": false,
+    "description": "是否启用白名单权限管理（启用后仅白名单用户可使用）"
+  },
+  "whitelist_users": {
+    "type": "list",
+    "default": [],
+    "description": "白名单用户ID列表（使用 /ql whoami 查看用户ID）"
   }
 }
