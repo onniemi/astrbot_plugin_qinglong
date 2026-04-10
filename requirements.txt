@@ -1,1 +1,2 @@
+# astrbot_plugin_qinglong v1.1.0
 httpx>=0.24.0
